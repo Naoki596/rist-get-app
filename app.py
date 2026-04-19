@@ -29,7 +29,8 @@ from unity_x_finder import (
 
 app = Flask(__name__)
 
-DEFAULT_QIITA_TOKEN = os.environ.get("QIITA_TOKEN", "8a3637134c130a379c9fd4e2aa4adf9389719451")
+# 環境変数 QIITA_TOKEN が設定されていればサーバー側で使用し、UIの入力欄を非表示にする
+_SERVER_QIITA_TOKEN = os.environ.get("QIITA_TOKEN", "").strip()
 
 # ---------- ジョブ管理 ----------
 # { job_id: { "status": str, "results": list, "logs": list,
@@ -213,7 +214,8 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
 # ---------- ルート ----------
 @app.route("/")
 def index():
-    return render_template("index.html", default_qiita_token=DEFAULT_QIITA_TOKEN)
+    # サーバー側にトークンが設定されていれば入力欄を隠す
+    return render_template("index.html", has_server_token=bool(_SERVER_QIITA_TOKEN))
 
 
 @app.route("/api/start", methods=["POST"])
@@ -222,7 +224,8 @@ def api_start():
     tag = str(data.get("tag", "Unity")).strip() or "Unity"
     qiita_count = int(data.get("qiita_count", 100))
     zenn_count = int(data.get("zenn_count", 100))
-    qiita_token = str(data.get("qiita_token", ""))
+    # 環境変数のトークンを優先。未設定の場合のみフロントからの値を使う
+    qiita_token = _SERVER_QIITA_TOKEN or str(data.get("qiita_token", ""))
     scan_body = bool(data.get("scan_body", False))
     max_requests = int(data.get("max_requests", 300))
 

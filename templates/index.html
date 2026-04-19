@@ -321,10 +321,20 @@ tbody td a:hover {
         <label for="zenn_count">Zenn取得件数</label>
         <input type="number" id="zenn_count" value="100" min="10" max="1000" step="10">
       </div>
+      {% if has_server_token %}
+      <div class="form-group">
+        <label>Qiitaトークン</label>
+        <div style="padding:8px 12px;border:1px solid #d1fae5;border-radius:6px;background:#f0fdf4;color:#166534;font-size:0.85rem;">
+          ✓ サーバーで設定済み
+        </div>
+        <input type="hidden" id="qiita_token" value="">
+      </div>
+      {% else %}
       <div class="form-group">
         <label for="qiita_token">Qiitaトークン（任意）</label>
-        <input type="password" id="qiita_token" value="{{ default_qiita_token }}" placeholder="未設定でも動作します">
+        <input type="password" id="qiita_token" value="" placeholder="未設定でも動作します（レート制限あり）">
       </div>
+      {% endif %}
       <div class="form-group">
         <label for="max_requests">リクエスト上限</label>
         <input type="number" id="max_requests" value="300" min="50" max="2000" step="50">
@@ -416,7 +426,7 @@ tbody td a:hover {
     $tag.disabled = running;
     $qiitaCount.disabled = running;
     $zennCount.disabled = running;
-    $qiitaToken.disabled = running;
+    if ($qiitaToken && $qiitaToken.type !== "hidden") $qiitaToken.disabled = running;
     $scanBody.disabled = running;
     $maxRequests.disabled = running;
   }
