@@ -13,6 +13,7 @@ Flask Webアプリケーション。unity_x_finder.py の収集ロジックをWe
 import csv
 import io
 import os
+import sqlite3
 import threading
 import time
 import uuid
@@ -32,84 +33,162 @@ app = Flask(__name__)
 # 環境変数 QIITA_TOKEN が設定されていればサーバー側で使用し、UIの入力欄を非表示にする
 _SERVER_QIITA_TOKEN = os.environ.get("QIITA_TOKEN", "").strip()
 
-# ---------- ジョブ管理 ----------
-# { job_id: { "status": str, "results": list, "logs": list,
-#              "request_count": int, "fetcher": Fetcher|None } }
-jobs: dict = {}
-jobs_lock = threading.Lock()
+# SQLite のパス。Railway は /tmp が書き込み可能。
+DB_PATH = os.environ.get("DB_PATH", "/tmp/jobs.db")
+
+# キャンセル用 Fetcher オブジェクトのみメモリ管理（DB に入れられないため）
+_fetchers: dict = {}
+_fetchers_lock = threading.Lock()
+
+# DB への同時書き込みを直列化するロック
+_db_write_lock = threading.Lock()
 
 
-def _create_job() -> str:
-    job_id = uuid.uuid4().hex[:12]
-    with jobs_lock:
-        jobs[job_id] = {
-            "status": "running",
-            "results": [],
-            "logs": [],
-            "request_count": 0,
-            "fetcher": None,
+# ---------- DB 初期化 ----------
+def _init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                job_id      TEXT PRIMARY KEY,
+                status      TEXT NOT NULL DEFAULT 'running',
+                request_count INTEGER NOT NULL DEFAULT 0,
+                created_at  REAL NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_results (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                source      TEXT,
+                handle      TEXT,
+                author      TEXT,
+                article_title TEXT,
+                article_url TEXT,
+                detected_by TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS job_logs (
+                id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id  TEXT NOT NULL,
+                message TEXT
+            )
+        """)
+        conn.commit()
+
+
+_init_db()
+
+
+# ---------- DB ヘルパー ----------
+def _db_create_job(job_id: str):
+    with _db_write_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO jobs (job_id, status, request_count, created_at) VALUES (?, 'running', 0, ?)",
+                (job_id, time.time()),
+            )
+            conn.commit()
+
+
+def _db_log(job_id: str, msg: str):
+    with _db_write_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT INTO job_logs (job_id, message) VALUES (?, ?)", (job_id, msg))
+            conn.commit()
+
+
+def _db_add_result(job_id: str, row: dict):
+    with _db_write_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT INTO job_results (job_id, source, handle, author, article_title, article_url, detected_by)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    job_id,
+                    row.get("source", ""),
+                    row.get("handle", ""),
+                    row.get("author", ""),
+                    row.get("article_title", ""),
+                    row.get("article_url", ""),
+                    row.get("detected_by", ""),
+                ),
+            )
+            conn.commit()
+
+
+def _db_update_request_count(job_id: str, count: int):
+    with _db_write_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE jobs SET request_count = ? WHERE job_id = ?", (count, job_id))
+            conn.commit()
+
+
+def _db_set_status(job_id: str, status: str):
+    with _db_write_lock:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE jobs SET status = ? WHERE job_id = ?", (status, job_id))
+            conn.commit()
+
+
+def _db_get_job(job_id: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        results = [
+            dict(r) for r in conn.execute(
+                "SELECT source, handle, author, article_title, article_url, detected_by"
+                " FROM job_results WHERE job_id = ? ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        ]
+        logs = [
+            r["message"] for r in conn.execute(
+                "SELECT message FROM job_logs WHERE job_id = ? ORDER BY id",
+                (job_id,),
+            ).fetchall()
+        ]
+        return {
+            "status": row["status"],
+            "request_count": row["request_count"],
+            "results": results,
+            "logs": logs,
         }
-    return job_id
 
 
-def _log(job_id: str, msg: str):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["logs"].append(msg)
-
-
-def _add_result(job_id: str, row: dict):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["results"].append(row)
-
-
-def _update_request_count(job_id: str, count: int):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["request_count"] = count
-
-
-def _set_status(job_id: str, status: str):
-    with jobs_lock:
-        if job_id in jobs:
-            jobs[job_id]["status"] = status
-
-
-# ---------- 収集ロジック (tkinter版の _run を移植) ----------
+# ---------- 収集ロジック ----------
 def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
                     qiita_token: str, scan_body: bool, max_requests: int):
     try:
         f = Fetcher(qiita_token, max_requests=max_requests)
-        with jobs_lock:
-            jobs[job_id]["fetcher"] = f
+        with _fetchers_lock:
+            _fetchers[job_id] = f
 
         def log(msg):
-            _log(job_id, msg)
+            _db_log(job_id, msg)
 
-        # タイムアウト等で自動リトライが走ったときもユーザー画面に通知する
         f.retry_logger = log
 
-        seen = set()  # (source, handle) の重複除去
+        seen = set()
 
         # ----- Qiita -----
         try:
             q_items = f.qiita_tag_items(tag, qiita_count, log)
-            _update_request_count(job_id, f.request_count)
+            _db_update_request_count(job_id, f.request_count)
             log(f"[Qiita] 記事 {len(q_items)} 件取得")
-            # ユーザー単位でまとめてから個別取得
             user_to_items: dict = {}
             for it in q_items:
                 uid = it.get("user", {}).get("id")
                 if uid:
                     user_to_items.setdefault(uid, []).append(it)
             for uid, its in user_to_items.items():
-                # 記事一覧のuserオブジェクトにtwitter_screen_nameがあればそれを使う
                 handle = its[0].get("user", {}).get("twitter_screen_name") or ""
                 if not handle:
-                    # 念のためユーザー詳細も見る
                     u = f.qiita_user(uid, log)
-                    _update_request_count(job_id, f.request_count)
+                    _db_update_request_count(job_id, f.request_count)
                     if u:
                         handle = u.get("twitter_screen_name") or ""
                 sample = its[0]
@@ -117,7 +196,7 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
                     key = ("qiita", handle.lower())
                     if key not in seen:
                         seen.add(key)
-                        _add_result(job_id, {
+                        _db_add_result(job_id, {
                             "source": "Qiita",
                             "handle": handle,
                             "author": sample.get("user", {}).get("id", ""),
@@ -125,7 +204,6 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
                             "article_url": sample.get("url", ""),
                             "detected_by": "プロフィール",
                         })
-                # 本文中スキャン
                 if scan_body:
                     for it in its:
                         body = it.get("body", "") or it.get("rendered_body", "")
@@ -133,7 +211,7 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
                             key = ("qiita", h)
                             if key not in seen:
                                 seen.add(key)
-                                _add_result(job_id, {
+                                _db_add_result(job_id, {
                                     "source": "Qiita",
                                     "handle": h,
                                     "author": it.get("user", {}).get("id", ""),
@@ -147,11 +225,11 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
         except Exception as e:
             log(f"[Qiita] エラー: {e}")
 
-        # ----- Zenn（キャンセル・上限到達時はスキップ） -----
+        # ----- Zenn -----
         if not f._cancelled and f.request_count < f.max_requests:
             try:
                 z_items = f.zenn_topic_articles(tag.lower(), zenn_count, log)
-                _update_request_count(job_id, f.request_count)
+                _db_update_request_count(job_id, f.request_count)
                 log(f"[Zenn] 記事 {len(z_items)} 件取得")
                 user_to_items = {}
                 for it in z_items:
@@ -160,14 +238,14 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
                         user_to_items.setdefault(uname, []).append(it)
                 for uname, its in user_to_items.items():
                     user = f.zenn_user(uname, log)
-                    _update_request_count(job_id, f.request_count)
+                    _db_update_request_count(job_id, f.request_count)
                     handle = (user or {}).get("twitter_username") or ""
                     sample = its[0]
                     if handle:
                         key = ("zenn", handle.lower())
                         if key not in seen:
                             seen.add(key)
-                            _add_result(job_id, {
+                            _db_add_result(job_id, {
                                 "source": "Zenn",
                                 "handle": handle,
                                 "author": uname,
@@ -178,12 +256,12 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
                     if scan_body:
                         for it in its:
                             body = f.zenn_article_body(uname, it.get("slug", ""), log)
-                            _update_request_count(job_id, f.request_count)
+                            _db_update_request_count(job_id, f.request_count)
                             for h in extract_handles_from_text(body):
                                 key = ("zenn", h)
                                 if key not in seen:
                                     seen.add(key)
-                                    _add_result(job_id, {
+                                    _db_add_result(job_id, {
                                         "source": "Zenn",
                                         "handle": h,
                                         "author": uname,
@@ -198,23 +276,22 @@ def _run_collection(job_id: str, tag: str, qiita_count: int, zenn_count: int,
             except Exception as e:
                 log(f"[Zenn] エラー: {e}")
 
-        result_count = len(jobs[job_id]["results"])
+        job = _db_get_job(job_id)
+        result_count = len(job["results"]) if job else 0
         log(f"=== 完了: Xアカウント {result_count} 件 / APIリクエスト {f.request_count} 回 ===")
-        _update_request_count(job_id, f.request_count)
-        _set_status(job_id, "completed")
+        _db_update_request_count(job_id, f.request_count)
+        _db_set_status(job_id, "completed")
     except Exception as e:
-        _log(job_id, f"予期しないエラー: {e}")
-        _set_status(job_id, "error")
+        _db_log(job_id, f"予期しないエラー: {e}")
+        _db_set_status(job_id, "error")
     finally:
-        with jobs_lock:
-            if job_id in jobs:
-                jobs[job_id]["fetcher"] = None
+        with _fetchers_lock:
+            _fetchers.pop(job_id, None)
 
 
 # ---------- ルート ----------
 @app.route("/")
 def index():
-    # サーバー側にトークンが設定されていれば入力欄を隠す
     return render_template("index.html", has_server_token=bool(_SERVER_QIITA_TOKEN))
 
 
@@ -224,12 +301,13 @@ def api_start():
     tag = str(data.get("tag", "Unity")).strip() or "Unity"
     qiita_count = int(data.get("qiita_count", 100))
     zenn_count = int(data.get("zenn_count", 100))
-    # 環境変数のトークンを優先。未設定の場合のみフロントからの値を使う
     qiita_token = _SERVER_QIITA_TOKEN or str(data.get("qiita_token", ""))
     scan_body = bool(data.get("scan_body", False))
     max_requests = int(data.get("max_requests", 300))
 
-    job_id = _create_job()
+    job_id = uuid.uuid4().hex[:12]
+    _db_create_job(job_id)
+
     t = threading.Thread(
         target=_run_collection,
         args=(job_id, tag, qiita_count, zenn_count, qiita_token, scan_body, max_requests),
@@ -241,36 +319,29 @@ def api_start():
 
 @app.route("/api/status/<job_id>", methods=["GET"])
 def api_status(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = _db_get_job(job_id)
     if job is None:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "status": job["status"],
-        "results": job["results"],
-        "logs": job["logs"],
-        "request_count": job["request_count"],
-    })
+    return jsonify(job)
 
 
 @app.route("/api/cancel/<job_id>", methods=["POST"])
 def api_cancel(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = _db_get_job(job_id)
     if job is None:
         return jsonify({"error": "Job not found"}), 404
-    fetcher = job.get("fetcher")
+    with _fetchers_lock:
+        fetcher = _fetchers.get(job_id)
     if fetcher is not None:
         fetcher.cancel()
-        _log(job_id, "中断を要求しました...")
+        _db_log(job_id, "中断を要求しました...")
         return jsonify({"message": "Cancel requested"})
     return jsonify({"message": "Job is not running"}), 400
 
 
 @app.route("/api/csv/<job_id>", methods=["GET"])
 def api_csv(job_id):
-    with jobs_lock:
-        job = jobs.get(job_id)
+    job = _db_get_job(job_id)
     if job is None:
         return jsonify({"error": "Job not found"}), 404
 

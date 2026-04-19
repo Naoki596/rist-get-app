@@ -401,6 +401,8 @@ tbody td a:hover {
   let renderedResultCount = 0;
   let renderedLogCount = 0;
   let hasResults = false;
+  let consecutiveErrors = 0;
+  const MAX_CONSECUTIVE_ERRORS = 3;
 
   const $tag = document.getElementById("tag");
   const $qiitaCount = document.getElementById("qiita_count");
@@ -542,6 +544,7 @@ tbody td a:hover {
 
   function startPolling() {
     if (pollTimer) clearInterval(pollTimer);
+    consecutiveErrors = 0;
     pollTimer = setInterval(pollStatus, 1500);
   }
 
@@ -557,8 +560,19 @@ tbody td a:hover {
 
     try {
       const resp = await fetch("/api/status/" + jobId);
+
+      // 404 = サーバー再起動等でジョブが消えた → 即停止
+      if (resp.status === 404) {
+        stopPolling();
+        setRunning(false);
+        $statusText.textContent = "エラー: ジョブが見つかりません（サーバーが再起動した可能性があります）";
+        appendLog("[ERROR] ジョブが消失しました。収集をやり直してください。");
+        return;
+      }
+
       if (!resp.ok) throw new Error("ステータス取得失敗: " + resp.status);
 
+      consecutiveErrors = 0;
       const data = await resp.json();
 
       // Update request count
@@ -597,7 +611,15 @@ tbody td a:hover {
         $statusText.textContent = "収集中...";
       }
     } catch (e) {
+      consecutiveErrors++;
       appendLog("[ERROR] ポーリングエラー: " + e.message);
+      // 連続エラーが上限を超えたら自動停止
+      if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS) {
+        stopPolling();
+        setRunning(false);
+        $statusText.textContent = "エラー: サーバーに接続できません";
+        appendLog("[ERROR] 接続エラーが続くため自動停止しました。ページを再読み込みして再試行してください。");
+      }
     }
   }
 
